@@ -49,7 +49,8 @@ claude --plugin-dir ./claude-code-board
 
 - Built on Claude Code function hooks (`hooks/register.tsx`), an early-access API: tested on Claude Code 2.1.296, and it may change between releases.
 - Costs are estimates from token counts and a per-model price table (`PRICES` in `hooks/register.tsx`, list prices as of 2026-10-10, taken from [johnnyvizz/claude-kit](https://github.com/johnnyvizz/claude-kit), MIT), not a bill.
-- File changes made through Bash (`sed`, `mv`, scripts) are not seen.
+- File changes made through Bash (`sed`, redirects, scripts) are found by comparing the working directory's files (size and modification time) before and after each Bash call: up to 20,000 entries, 8 levels deep, skipping `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `dist`, `build`, `target` and `.next`. Lines are shown for a new file, and for a changed file whose earlier text the board saw; otherwise the change is listed without its lines. Deleted files and commands run in the background are not seen.
+- Agents already running when the board loads (installed or reloaded mid-prompt) are put on the board right away.
 - The `step` brief is appended to every subagent's prompt, which costs a few tokens per subagent.
 
 ## Develop

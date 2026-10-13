@@ -9,10 +9,10 @@ const BAND = {
   scroll: { offset: 0, bodyRows: 19 },
 }
 
-function engine(on: On) {
+function engine(on: On, { hasTools = true } = {}) {
   mock.clock(on, { now: 1_000_000 })
   on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
-  on('tool.call', () => ({ result: 'ok', text: 'ok' }) as never)
+  if (hasTools) on('tool.call', () => ({ result: 'ok', text: 'ok' }) as never)
   on('turn.complete', () => ({ text: '' }))
   on('prompt.submit', ($, e) => ({ text: e.text }) as never)
   on('ui.open', () => ({ value: { isPlaced: false } }) as never)
@@ -123,6 +123,77 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await agents.find({ text: /new\.ts/ })).toBeDefined()
   })
 }
+
+// a working directory whose listing a Bash call changes
+function disk(on: On, before: Record<string, string>, after: Record<string, string>) {
+  let current = before
+  const entries = () =>
+    Object.entries(current).map(([name, text]) => ({
+      name,
+      kind: 'file',
+      size: text.length,
+      mtimeMs: before[name] === text ? 1 : 2, // only a changed file gets a new mtime
+      isLink: false,
+    }))
+  on('session.cwd', () => ({ value: '/repo' }) as never)
+  on('fs.list', () => ({ value: entries() }) as never)
+  on('fs.read', ($, e) => ({ value: current[(e as { path: string }).path.replace('/repo/', '')] ?? '' }) as never)
+  on('tool.call', ($, e) => {
+    if ((e as { tool: string }).tool === 'Bash') current = after
+    return { result: 'ok', text: 'ok' } as never
+  })
+}
+
+const filesPane = (surface: 'terminal' | 'desktop') => ({
+  plugin: 'agent-board',
+  surface,
+  component: 'Pane',
+  requestId: 'agent-board-files',
+  props: { bodyColumns: 120 } as never,
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: files a Bash command writes show as changed`, async ($, on) => {
+    engine(on, { hasTools: false })
+    disk(on, { 'keep.txt': 'same\n' }, { 'keep.txt': 'same\n', 'count.txt': '1\n2\n3\n' })
+
+    await $.tool.call({ tool: 'Bash', command: 'seq 1 3 > count.txt' } as never)
+
+    const pane = await $.ui.mount(filesPane(surface) as never)
+    expect(await pane.find({ text: /Files changed · 1/ })).toBeDefined()
+    expect(await pane.find({ text: /count\.txt/ })).toBeDefined()
+    expect(await pane.find({ text: /keep\.txt/ })).toBeUndefined()
+    expect(await pane.find({ text: ' A ' })).toBeDefined()
+    expect(await pane.find({ text: /\+3/ })).toBeDefined()
+  })
+}
+
+test('a file Bash changes without a known earlier text says its lines are not known', async ($, on) => {
+  engine(on, { hasTools: false })
+  disk(on, { 'log.txt': 'a\n' }, { 'log.txt': 'a\nb\n' })
+
+  await $.tool.call({ tool: 'Bash', command: 'echo b >> log.txt' } as never)
+
+  const pane = await $.ui.mount(filesPane('terminal') as never)
+  expect(await pane.find({ text: ' M ' })).toBeDefined()
+  await pane.press({ key: 'file:/repo/log.txt' })
+  expect(await pane.find({ text: /the lines are not known/ })).toBeDefined()
+})
+
+test('agents already running when the board loads are on it', async ($, on) => {
+  engine(on)
+  on('session.start', () => ({ cwd: '/repo' }) as never)
+  on('tool.register', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('agent.list', () => ({
+    value: [{ id: 'a9', description: 'Count 1 to 7', type: 'general-purpose', status: 'running' }],
+  }) as never)
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal' } as never)
+
+  const band = await $.ui.mount({ plugin: 'agent-board', surface: 'terminal', component: 'AbovePrompt', props: BAND as never })
+  expect(await band.find({ text: /Count 1 to 7/ })).toBeDefined()
+})
 
 test('a subagent hand-back does not reset the board', async ($, on) => {
   engine(on)

@@ -208,15 +208,22 @@ function changeOf(tool: string, a: Record<string, unknown>, p: Pending): DiffLin
 }
 
 async function recordChange($: $, who: string, tool: string, a: Record<string, unknown>, p: Pending) {
-  const diff = changeOf(tool, a, p)
+  if (tool === 'Write' && typeof a.content === 'string') remember(p.path, a.content)
+  await addEdit($, p.path, who, tool, p.existed, changeOf(tool, a, p))
+  // a Bash call running beside this one must not record the same change again
+  const stat = await $.fs.stat(p.path).catch(() => undefined)
+  if (stat) claimed.set(p.path, stat.mtimeMs)
+}
+
+async function addEdit($: $, path: string, who: string, tool: string, existed: boolean, diff: DiffLine[], isUnknown?: boolean) {
   const added = diff.filter(l => l.k === '+').length
   const removed = diff.length - added
   const at = await $.clock.now()
   await update($, files, all => {
-    const prev = all[p.path]
+    const prev = all[path]
     const next: FileChange = {
-      path: p.path,
-      status: prev?.status ?? (p.existed ? 'M' : 'A'),
+      path,
+      status: prev?.status ?? (existed ? 'M' : 'A'),
       added: (prev?.added ?? 0) + added,
       removed: (prev?.removed ?? 0) + removed,
       edits: (prev?.edits ?? 0) + 1,
@@ -224,11 +231,81 @@ async function recordChange($: $, who: string, tool: string, a: Record<string, u
       lastAt: at,
       history: [
         ...(prev?.history ?? []),
-        { at, by: who, tool, lines: diff.slice(0, KEEP_LINES), more: Math.max(0, diff.length - KEEP_LINES) },
+        {
+          at,
+          by: who,
+          tool,
+          lines: diff.slice(0, KEEP_LINES),
+          more: Math.max(0, diff.length - KEEP_LINES),
+          ...(isUnknown ? { isUnknown } : {}),
+        },
       ].slice(-KEEP_EDITS),
     }
-    return { ...all, [p.path]: next }
+    return { ...all, [path]: next }
   })
+}
+
+// ── files changed through Bash ────────────────────────────────────────────
+// A Bash command names no file, so the board compares the working directory's
+// files (size and mtime) before and after each Bash call. Lines are known for
+// a new file, and for a changed one whose text the board saw before.
+
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build', 'target', '.next'])
+const SCAN_MAX = 20_000 // entries looked at per scan
+const SCAN_DEPTH = 8
+const TEXT_MAX = 256 * 1024 // bytes read back for a file's lines
+const KEEP_TEXTS = 200 // file texts remembered for the next diff
+
+type Stamp = { size: number; mtimeMs: number }
+type Scan = { files: Map<string, Stamp>; isComplete: boolean }
+
+const texts = new Map<string, string>() // last text seen per path
+const claimed = new Map<string, number>() // mtime already recorded per path
+
+function remember(path: string, text: string) {
+  texts.delete(path)
+  texts.set(path, text)
+  if (texts.size > KEEP_TEXTS) texts.delete(texts.keys().next().value as string)
+}
+
+async function scan($: $, root: string): Promise<Scan> {
+  const found = new Map<string, Stamp>()
+  const dirs: [string, number][] = [[root, 0]]
+  let seen = 0
+  while (dirs.length > 0) {
+    const [dir, depth] = dirs.pop() as [string, number]
+    const entries = await $.fs.list(dir).catch(() => [])
+    for (const entry of entries) {
+      if (++seen > SCAN_MAX) return { files: found, isComplete: false }
+      const path = `${dir.replace(/\/$/, '')}/${entry.name}`
+      if (entry.kind === 'file') found.set(path, { size: entry.size, mtimeMs: entry.mtimeMs })
+      else if (entry.kind === 'dir' && depth < SCAN_DEPTH && !SKIP_DIRS.has(entry.name)) dirs.push([path, depth + 1])
+    }
+  }
+  return { files: found, isComplete: true }
+}
+
+async function textOf($: $, path: string, size: number): Promise<string | undefined> {
+  if (size > TEXT_MAX) return undefined
+  const text = await $.fs.read(path).catch(() => undefined)
+  return typeof text === 'string' && !text.includes('\u0000') ? text : undefined
+}
+
+async function recordBashChanges($: $, who: string, before: Scan, after: Scan) {
+  for (const [path, stamp] of after.files) {
+    const prev = before.files.get(path)
+    // a file missing from an incomplete scan may only have gone unseen
+    if (prev ? prev.size === stamp.size && prev.mtimeMs === stamp.mtimeMs : !before.isComplete) continue
+    if (claimed.get(path) === stamp.mtimeMs) continue
+    claimed.set(path, stamp.mtimeMs)
+
+    const text = await textOf($, path, stamp.size)
+    const known = texts.get(path)
+    if (text !== undefined) remember(path, text)
+    if (!prev) await addEdit($, path, who, 'Bash', false, text === undefined ? [] : lineDiff('', text), text === undefined)
+    else if (known !== undefined && text !== undefined) await addEdit($, path, who, 'Bash', true, lineDiff(known, text))
+    else await addEdit($, path, who, 'Bash', true, [], true)
+  }
 }
 
 // ── state ─────────────────────────────────────────────────────────────────
@@ -482,7 +559,8 @@ function treeView($: $, ui: El, list: FileChange[], open: string[], cols: number
                 <Text color="success">{`+${a}`}</Text>
                 <Text color="error">{` −${r}`}</Text>
               </Text>
-              {ed.lines.length === 0 ? <Text dimColor>{pad + '  (no line changes)'}</Text> : null}
+              {ed.isUnknown ? <Text dimColor>{pad + '  (changed through Bash; the lines are not known)'}</Text> : null}
+              {ed.lines.length === 0 && !ed.isUnknown ? <Text dimColor>{pad + '  (no line changes)'}</Text> : null}
               {ed.lines.map(x => (
                 <Text wrap="truncate-end">
                   <Text dimColor>{pad + '  '}</Text>
@@ -566,6 +644,24 @@ export const register: Register = on => {
       description:
         'Open or close the agents panel; `/board files` the changed-files tree; `/board hide` or `/board show` the band',
     })
+
+    // Agents already running when the board loads (installed or reloaded
+    // mid-prompt) missed agent.spawn: put them on the board now.
+    try {
+      const at = await $.clock.now()
+      const running = (await $.agent.list()).filter(a => STATUS_OF[a.status] === 'running')
+      if (running.length > 0) {
+        await update($, rows, all => {
+          const out: Record<string, Row> = { ...all }
+          for (const a of running) {
+            out[a.id] ??= { ...freshRow(a.id, at), type: a.type || 'agent', desc: a.description || '', parentId: a.parentId }
+          }
+          return out
+        })
+      }
+    } catch {
+      // bookkeeping only
+    }
 
     let isRefreshing = false
     let count = 0
@@ -714,13 +810,23 @@ export const register: Register = on => {
 
     const args = e as unknown as Record<string, unknown>
     const pending = FILE_TOOLS.has(e.tool) ? await beforeChange($, e.tool, args) : undefined
+    const root = e.tool === 'Bash' ? await $.session.cwd().catch(() => undefined) : undefined
+    const before = root ? await scan($, root).catch(() => undefined) : undefined
 
     const ran = await next(e)
 
+    const who = async () => (id === MAIN ? 'main' : (await read($, rows))[id]?.type ?? 'agent')
     if (pending && ran.deny === undefined && !ran.isError) {
       try {
-        const row = (await read($, rows))[id]
-        await recordChange($, id === MAIN ? 'main' : row?.type ?? 'agent', e.tool, args, pending)
+        await recordChange($, await who(), e.tool, args, pending)
+      } catch {
+        // bookkeeping only
+      }
+    }
+    // a failed command may still have written files
+    if (root && before && ran.deny === undefined) {
+      try {
+        await recordBashChanges($, await who(), before, await scan($, root))
       } catch {
         // bookkeeping only
       }

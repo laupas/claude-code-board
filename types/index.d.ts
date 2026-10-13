@@ -35,7 +35,7 @@ export type Ctx = {
 
 export type DiffLine = { k: '+' | '-'; t: string }
 
-export type Edit = { at: number; by: string; tool: string; lines: DiffLine[]; more: number }
+export type Edit = { at: number; by: string; tool: string; lines: DiffLine[]; more: number; isUnknown?: boolean }
 
 export type FileChange = {
   path: string
