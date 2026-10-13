@@ -1,0 +1,13 @@
+{
+  "name": "agent-board",
+  "description": "A live board above the Claude Code prompt: context, agents with progress, and changed files.",
+  "owner": {
+    "name": "Pascal Lauener"
+  },
+  "plugins": [
+    {
+      "name": "agent-board",
+      "source": "./"
+    }
+  ]
+}
